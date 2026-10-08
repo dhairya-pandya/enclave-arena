@@ -138,3 +138,36 @@ def test_docker_isolation(tmp_path, name, body):
     src = HEAD + body + "class Agent(Agent):\n    def reset(self, c):\n        pass\n"
     res = play(tmp_path, src, n=3, backend=DockerBackend(), reset_timeout_s=5)
     assert res["slots"][0]["status"] == "reset_failed"
+
+
+def test_sustained_slowness_disqualifies_and_match_still_finishes(tmp_path):
+    src = HEAD + "import time\nclass Agent(Agent):\n    def act(self, obs):\n        time.sleep(0.3)\n        return 1\n"
+    res = play(tmp_path, src, n=120, hard_timeout_s=1.0)
+    s = res["slots"][0]
+    assert s["status"] == "too_slow"
+    assert len(res["action_log"]) == 120                     # nobody kept waiting
+    assert all(row[0] == 0 for row in res["action_log"])
+
+
+def test_occasional_slowness_is_tolerated(tmp_path):
+    src = (HEAD + "import time\nclass Agent(Agent):\n    n = 0\n    def act(self, obs):\n"
+           "        self.n += 1\n        if self.n % 20 == 0:\n            time.sleep(0.12)\n        return 1\n")
+    res = play(tmp_path, src, n=100)
+    s = res["slots"][0]
+    assert s["status"] == "ok" and 0 < s["strikes"] <= 6      # 5 late decisions, each played straight
+
+
+def test_agent_cannot_hide_slowness_by_patching_the_clock(tmp_path):
+    src = (HEAD + "import time\nclass Agent(Agent):\n    def reset(self, c):\n"
+           "        time.perf_counter = lambda: 0.0\n    def act(self, obs):\n"
+           "        time.sleep(0.2)\n        return 1\n")
+    res = play(tmp_path, src, n=10)
+    assert res["slots"][0]["strikes"] == 10                    # reported 0 ms, runner's clock disagreed
+    assert all(row[0] == 0 for row in res["action_log"])
+
+
+def test_validation_rejects_sustained_slowness(tmp_path):
+    f = tmp_path / "slow.py"
+    f.write_text(HEAD + "import time\nclass Agent(Agent):\n    def act(self, obs):\n        time.sleep(0.12)\n        return 1\n")
+    r = validate_sandboxed(str(f), decisions=80)
+    assert not r["ok"] and "too slow" in r["error"]
