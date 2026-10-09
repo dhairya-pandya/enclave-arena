@@ -12,10 +12,14 @@ Per-decision rules: all sandboxed agents think in parallel. An answer whose
 measured `act()` time exceeds ACT_TIMEOUT_MS counts as action 0 plus a strike;
 an exception or invalid return is action 0 plus an error. An agent that exits or
 sends nothing within `hard_timeout_s` is killed and plays action 0 for the rest
-of the match.
+of the match. Time is measured by the runner (send to receive), not taken from
+the agent's own report, so patching the clock inside the sandbox does not help.
+An agent that is slow on more than SLOW_FRACTION of decisions, or keeps the
+match waiting more than SLOW_WAIT_BUDGET_S in total, is disqualified ("too_slow").
 """
 
 import itertools
+import json
 import os
 import queue
 import shutil
@@ -36,6 +40,13 @@ from papersseum.sandbox import protocol as P
 RESET_TIMEOUT_S = 2.0
 HARD_TIMEOUT_S = 1.0          # no answer at all within this => agent is dead
 MATCH_TIMEOUT_S = 600.0
+
+# Sustained slowness disqualifies an agent (it plays straight, nobody waits for
+# it). Occasional slow decisions only cost that decision.
+SLOW_FRACTION = 0.20          # more than this share of decisions over budget...
+SLOW_MIN_DECISIONS = 50       # ...once at least this many have been played
+SLOW_WAIT_BUDGET_S = 20.0     # or this much total time spent waiting past budget
+TIMING_SLACK_MS = 25.0        # pipe + observation build, allowed on top of the budget
 
 
 class MatchTimeout(RuntimeError):
@@ -127,9 +138,13 @@ class _Remote:
     def __init__(self, slot, proc, agent_path, weights_dir):
         self.slot, self.proc = slot, proc
         self.agent_path, self.weights_dir = agent_path, weights_dir
-        self.q = queue.Queue()
+        self.q = queue.Queue(maxsize=64)      # a flooding agent only blocks itself
+        self.stop = False
         self.dead = False
-        self.status = "ok"             # ok | reset_failed | crashed | unresponsive
+        self.status = "ok"             # ok | reset_failed | crashed | unresponsive | too_slow
+        self.decisions = 0
+        self.over_s = 0.0
+        self.sent_at = 0.0
         self.error = None
         self.strikes = 0
         self.errors = 0
@@ -144,10 +159,20 @@ class _Remote:
                 fr = P.read_frame(self.proc.popen.stdout)
                 if fr is None:
                     break
-                self.q.put(fr)
+                if not self._put((time.monotonic(), fr)):
+                    return
         except Exception:
             pass
-        self.q.put(None)
+        self._put(None)
+
+    def _put(self, item):
+        while not self.stop:
+            try:
+                self.q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def send(self, kind, body=b""):
         try:
@@ -164,6 +189,7 @@ class _Remote:
 
     def die(self, status, error=None):
         self.dead = True
+        self.stop = True
         if self.status == "ok":
             self.status = status
             self.error = error
@@ -235,14 +261,13 @@ def run_sandboxed_match(seed, agents, backend=None, max_decisions=None, players=
             r.send(b"I", {"agent_path": r.agent_path, "config": _config(seed, slot, r.weights_dir)})
         deadline = time.monotonic() + reset_timeout_s
         for slot, r in remotes.items():
-            fr = r.get(deadline - time.monotonic())
-            if fr == "timeout":
+            item = r.get(deadline - time.monotonic())
+            if item == "timeout":
                 r.die("reset_failed", f"reset exceeded {reset_timeout_s}s")
-            elif fr is None:
+            elif item is None:
                 r.die("reset_failed", "process exited during load/reset")
             else:
-                import json
-                msg = json.loads(fr[1])
+                msg = json.loads(item[1][1])
                 if not msg.get("ok"):
                     r.die("reset_failed", msg.get("error", "reset failed"))
         for slot, ag in local.items():
@@ -262,6 +287,7 @@ def run_sandboxed_match(seed, agents, backend=None, max_decisions=None, players=
             for slot, r in remotes.items():
                 if r.dead:
                     continue
+                r.sent_at = time.monotonic()
                 if r.send(b"S", body):
                     waiting.append(r)
                 else:
@@ -276,29 +302,43 @@ def run_sandboxed_match(seed, agents, backend=None, max_decisions=None, players=
             deadline = time.monotonic() + hard_timeout_s
             for r in waiting:
                 while True:
-                    fr = r.get(deadline - time.monotonic())
-                    if fr == "timeout":
+                    item = r.get(deadline - time.monotonic())
+                    if item == "timeout":
                         r.die("unresponsive", f"no answer within {hard_timeout_s}s")
                         break
-                    if fr is None:
+                    if item is None:
                         r.die("crashed", "process exited")
                         break
+                    recv_at, fr = item
                     if fr[0] != b"A":
                         continue
-                    import json
-                    msg = json.loads(fr[1])
-                    if msg.get("seq") != seq:
+                    try:
+                        msg = json.loads(fr[1])
+                        if msg.get("seq") != seq:
+                            continue
+                        reported_ms = float(msg.get("ms", 0.0))
+                        action = int(msg["a"])
+                    except (ValueError, KeyError, TypeError):
                         continue
-                    ms = float(msg.get("ms", 0.0))
+                    # trust our own clock; the agent's report only adds information
+                    wall_ms = (recv_at - r.sent_at) * 1000.0
+                    ms = max(reported_ms, wall_ms - TIMING_SLACK_MS)
                     r.max_ms = max(r.max_ms, ms)
+                    r.decisions += 1
                     if msg.get("err"):
                         r.errors += 1
                         if len(r.first_errors) < 3:
-                            r.first_errors.append(msg["err"])
+                            r.first_errors.append(str(msg["err"])[:300])
                     elif ms > act_timeout_ms:
                         r.strikes += 1
-                    else:
-                        actions[r.slot] = int(msg["a"])
+                        r.over_s += (ms - act_timeout_ms) / 1000.0
+                    elif action in (0, 1, 2):
+                        actions[r.slot] = action
+                    too_many = (r.decisions >= SLOW_MIN_DECISIONS
+                                and r.strikes > SLOW_FRACTION * r.decisions)
+                    if too_many or r.over_s > SLOW_WAIT_BUDGET_S:
+                        r.die("too_slow", f"{r.strikes} of {r.decisions} decisions over "
+                                          f"{act_timeout_ms} ms; {r.over_s:.1f}s spent waiting")
                     break
             row = [actions[s] for s in range(C.N_PLAYERS)]
             action_log.append(row)
@@ -336,10 +376,12 @@ def run_sandboxed_match(seed, agents, backend=None, max_decisions=None, players=
 
 # ---------------------------------------------------------------- validation
 
-def validate_sandboxed(agent_file, backend=None, decisions=100, seed=7):
-    """Static scan, then a short smoke match with the agent in slot 0 against
-    four random house bots. Returns {ok, error, violations, warnings, stats}."""
-    from papersseum.agents import RandomAgent
+def validate_sandboxed(agent_file, backend=None, decisions=None, seed=7):
+    """Static scan, then a match with the agent in two slots (self-play) against
+    three baselines. The same slow-agent rule as the ladder applies, so passing
+    here means it will not be disqualified there. `decisions=None` plays the
+    whole match. Returns {ok, error, violations, warnings, stats}."""
+    from papersseum.agents import BASELINES
     from papersseum.security.static_check import scan_file
 
     report = scan_file(agent_file)
@@ -347,23 +389,30 @@ def validate_sandboxed(agent_file, backend=None, decisions=100, seed=7):
         v = report["violations"][0]
         return {"ok": False, "error": f'line {v["line"]}: {v["detail"]}',
                 "violations": report["violations"], "warnings": [], "stats": {}}
+    lobby = [agent_file, agent_file, BASELINES["greedy"](), BASELINES["safe_expander"](),
+             BASELINES["hunter"]()]
     try:
-        res = run_sandboxed_match(seed, [agent_file] + [RandomAgent() for _ in range(C.N_PLAYERS - 1)],
-                                  backend=backend, max_decisions=decisions)
+        res = run_sandboxed_match(seed, lobby, backend=backend, max_decisions=decisions)
     except Exception as e:
         return {"ok": False, "error": f"validation run failed: {e}", "violations": [],
                 "warnings": [], "stats": {}}
-    s = res["slots"][0]
-    warnings = []
     error = None
-    if s["status"] != "ok":
-        error = {"reset_failed": f'reset() failed: {s["error"]}',
-                 "crashed": "agent process crashed", "unresponsive": "agent stopped responding"}[s["status"]]
-    elif s["errors"]:
-        error = f'act() failed {s["errors"]} time(s): {s["first_errors"][0]}'
-    if s["strikes"]:
-        warnings.append(f'{s["strikes"]} decision(s) over the {C.ACT_TIMEOUT_MS} ms budget '
-                        f'(slowest {s["max_ms"]:.1f} ms)')
+    for s in res["slots"][:2]:
+        if s["status"] != "ok":
+            error = {"reset_failed": f'reset() failed: {s["error"]}',
+                     "crashed": "agent process crashed",
+                     "unresponsive": "agent stopped responding",
+                     "too_slow": f'agent is too slow: {s["error"]}'}[s["status"]]
+            break
+        if s["errors"]:
+            error = f'act() failed {s["errors"]} time(s): {s["first_errors"][0]}'
+            break
+    s0 = res["slots"][0]
+    warnings = []
+    if s0["strikes"] and error is None:
+        warnings.append(f'{s0["strikes"]} decision(s) over the {C.ACT_TIMEOUT_MS} ms budget '
+                        f'(slowest {s0["max_ms"]:.1f} ms); late decisions play straight')
     return {"ok": error is None, "error": error, "violations": [], "warnings": warnings,
-            "stats": {"max_ms": s["max_ms"], "strikes": s["strikes"], "errors": s["errors"],
+            "stats": {"max_ms": max(x["max_ms"] for x in res["slots"][:2]),
+                      "strikes": s0["strikes"], "errors": s0["errors"],
                       "decisions": len(res["action_log"])}}
